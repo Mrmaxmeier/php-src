@@ -78,6 +78,13 @@ static inline bool zend_optimizer_is_loop_var_free(const zend_op *opline) {
 		|| (opline->opcode == ZEND_FREE && opline->extended_value == ZEND_FREE_SWITCH);
 }
 
+/* Flags stored per opline by zend_optimizer_find_orphaned_tmp_uses(). */
+#define ZEND_ORPHANED_OP1 (1<<0)
+#define ZEND_ORPHANED_OP2 (1<<1)
+
+bool zend_optimizer_find_orphaned_tmp_uses(const zend_op_array *op_array,
+                                           const zend_cfg      *cfg,
+                                           uint8_t             *orphaned);
 void zend_optimizer_convert_to_free_op1(zend_op_array *op_array, zend_op *opline);
 int  zend_optimizer_add_literal(zend_op_array *op_array, const zval *zv);
 bool zend_optimizer_get_persistent_constant(zend_string *name, zval *result, int copy);

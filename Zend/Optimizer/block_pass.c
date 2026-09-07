@@ -931,6 +931,69 @@ optimize_const_unary_op:
 	}
 }
 
+/* Reduce an unreachable block to the FREE opcodes that end the live ranges of the
+ * variables it consumes: the loop var frees it already contains, plus a FREE for every
+ * ordinary temporary whose last use "orphaned" marks as living here. Everything else in
+ * the block is dead and becomes a NOP. */
+static void zend_reduce_unreachable_free_block(
+		zend_op_array *op_array, zend_basic_block *b, const uint8_t *orphaned)
+{
+	zend_op *slot = op_array->opcodes + b->start;
+	zend_op *end = slot + b->len;
+	zend_op *opline;
+	/* The frees are collected first, because writing them back overwrites the operands
+	 * they are derived from. There is one free per operand slot of the block at most. */
+	ALLOCA_FLAG(use_heap)
+	zend_op *frees;
+	uint32_t i, n = 0;
+
+	if (b->len == 0) {
+		return;
+	}
+	frees = do_alloca(2 * b->len * sizeof(zend_op), use_heap);
+
+	for (opline = slot; opline < end; opline++) {
+		uint32_t num = opline - op_array->opcodes;
+
+		if (zend_optimizer_is_loop_var_free(opline)) {
+			frees[n++] = *opline;
+			continue;
+		}
+		if (orphaned[num] & ZEND_ORPHANED_OP1) {
+			frees[n] = *opline;
+			frees[n].opcode = ZEND_FREE;
+			frees[n].extended_value = 0;
+			SET_UNUSED(frees[n].op2);
+			SET_UNUSED(frees[n].result);
+			n++;
+		}
+		if (orphaned[num] & ZEND_ORPHANED_OP2) {
+			frees[n] = *opline;
+			frees[n].opcode = ZEND_FREE;
+			frees[n].extended_value = 0;
+			COPY_NODE(frees[n].op1, opline->op2);
+			SET_UNUSED(frees[n].op2);
+			SET_UNUSED(frees[n].result);
+			n++;
+		}
+	}
+
+	/* An opline can free at most two variables while providing only one slot, so in
+	 * theory the frees may not fit. Emitting fewer of them just restores the previous
+	 * behaviour for the ones that are dropped. */
+	if (n > b->len) {
+		n = b->len;
+	}
+	for (i = 0; i < n; i++) {
+		slot[i] = frees[i];
+	}
+	for (; i < b->len; i++) {
+		MAKE_NOP(slot + i);
+	}
+
+	free_alloca(frees, use_heap);
+}
+
 /* Rebuild plain (optimized) op_array from CFG */
 static void assemble_code_blocks(zend_cfg *cfg, zend_op_array *op_array, zend_optimizer_ctx *ctx)
 {
@@ -1681,6 +1744,7 @@ void zend_optimize_cfg(zend_op_array *op_array, zend_optimizer_ctx *ctx)
 	zend_op **Tsource;
 	uint32_t opt_count;
 	int *jmp_hitlist;
+	uint8_t *orphaned;
 
     /* Build CFG */
 	checkpoint = zend_arena_checkpoint(ctx->arena);
@@ -1699,6 +1763,7 @@ void zend_optimize_cfg(zend_op_array *op_array, zend_optimizer_ctx *ctx)
 	Tsource = zend_arena_calloc(&ctx->arena, op_array->last_var + op_array->T, sizeof(zend_op *));
 	usage = zend_arena_alloc(&ctx->arena, bitset_len * ZEND_BITSET_ELM_SIZE);
 	jmp_hitlist = zend_arena_alloc(&ctx->arena, cfg.blocks_count * sizeof(int));
+	orphaned = zend_arena_alloc(&ctx->arena, op_array->last);
 
 	blocks = cfg.blocks;
 	end = blocks + cfg.blocks_count;
@@ -1726,13 +1791,15 @@ void zend_optimize_cfg(zend_op_array *op_array, zend_optimizer_ctx *ctx)
 		/* Eliminate NOPs */
 		for (b = blocks; b < end; b++) {
 			if (b->flags & ZEND_BB_UNREACHABLE_FREE) {
-				/* In unreachable_free blocks only preserve loop var frees. */
-				for (uint32_t i = b->start; i < b->start + b->len; i++) {
-					zend_op *opline = &op_array->opcodes[i];
-					if (!zend_optimizer_is_loop_var_free(opline)) {
-						MAKE_NOP(opline);
-					}
-				}
+				zend_optimizer_find_orphaned_tmp_uses(op_array, &cfg, orphaned);
+				break;
+			}
+		}
+		for (b = blocks; b < end; b++) {
+			if (b->flags & ZEND_BB_UNREACHABLE_FREE) {
+				/* In unreachable_free blocks only preserve the frees that end a live
+				 * range starting in a reachable block. */
+				zend_reduce_unreachable_free_block(op_array, b, orphaned);
 			}
 			if (b->flags & (ZEND_BB_REACHABLE|ZEND_BB_UNREACHABLE_FREE)) {
 				strip_nops(op_array, b);

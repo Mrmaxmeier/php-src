@@ -1070,6 +1070,100 @@ zend_op *zend_optimizer_get_loop_var_def(const zend_op_array *op_array, zend_op 
 	return NULL;
 }
 
+/* Keep in sync with keeps_op1_alive() in Zend/zend_opcode.c: these opcodes do not consume
+ * their OP1 operand, so they never end its live range. */
+static bool zend_optimizer_keeps_op1_alive(const zend_op *opline) {
+	return opline->opcode == ZEND_CASE
+		|| opline->opcode == ZEND_CASE_STRICT
+		|| opline->opcode == ZEND_SWITCH_LONG
+		|| opline->opcode == ZEND_SWITCH_STRING
+		|| opline->opcode == ZEND_MATCH
+		|| opline->opcode == ZEND_MATCH_ERROR
+		|| opline->opcode == ZEND_FETCH_LIST_R
+		|| opline->opcode == ZEND_FETCH_LIST_W
+		|| opline->opcode == ZEND_COPY_TMP;
+}
+
+/* Keep in sync with is_fake_def() in Zend/zend_opcode.c: these opcodes only modify their
+ * result, they do not create it. */
+static bool zend_optimizer_is_fake_def(const zend_op *opline) {
+	return opline->opcode == ZEND_ROPE_ADD
+		|| opline->opcode == ZEND_ADD_ARRAY_ELEMENT
+		|| opline->opcode == ZEND_ADD_ARRAY_UNPACK;
+}
+
+/* Finds the operands that zend_calc_live_ranges() would pick as the end of the live range
+ * of a temporary created in a reachable block, but that live in an unreachable block.
+ * Dropping such a block leaves the temporary without a live range, so nothing destroys it
+ * while an exception unwinds the reachable part of the function.
+ *
+ * "orphaned" must have room for op_array->last bytes and receives a ZEND_ORPHANED_OP1 /
+ * ZEND_ORPHANED_OP2 mask per opline. Returns whether anything was found. */
+bool zend_optimizer_find_orphaned_tmp_uses(
+		const zend_op_array *op_array, const zend_cfg *cfg, uint8_t *orphaned)
+{
+	uint32_t var_offset = op_array->last_var;
+	uint32_t i = op_array->last;
+	uint32_t *last_use;
+	uint8_t *last_use_op;
+	bool found = false;
+	ALLOCA_FLAG(use_heap)
+
+	memset(orphaned, 0, op_array->last);
+	if (!op_array->T) {
+		return false;
+	}
+
+	last_use = do_alloca(op_array->T * (sizeof(uint32_t) + sizeof(uint8_t)), use_heap);
+	last_use_op = (uint8_t*)(last_use + op_array->T);
+	memset(last_use, 0xff, op_array->T * sizeof(uint32_t));
+
+	/* Walk backwards, mirroring zend_calc_live_ranges(). */
+	while (i > 0) {
+		const zend_op *opline = &op_array->opcodes[--i];
+		uint32_t var;
+
+		/* SEPARATE redeclares its op1, but that is irrelevant for live ranges. */
+		if (opline->opcode == ZEND_SEPARATE) {
+			continue;
+		}
+
+		if ((opline->result_type & (IS_TMP_VAR|IS_VAR)) && !zend_optimizer_is_fake_def(opline)) {
+			var = EX_VAR_TO_NUM(opline->result.var) - var_offset;
+			if (last_use[var] != (uint32_t)-1) {
+				if ((cfg->blocks[cfg->map[i]].flags & ZEND_BB_REACHABLE)
+				 && !(cfg->blocks[cfg->map[last_use[var]]].flags & ZEND_BB_REACHABLE)) {
+					orphaned[last_use[var]] |= last_use_op[var];
+					found = true;
+				}
+				last_use[var] = (uint32_t)-1;
+			}
+		}
+
+		if ((opline->op1_type & (IS_TMP_VAR|IS_VAR))
+		 && !zend_optimizer_keeps_op1_alive(opline)) {
+			var = EX_VAR_TO_NUM(opline->op1.var) - var_offset;
+			if (last_use[var] == (uint32_t)-1) {
+				last_use[var] = i;
+				last_use_op[var] = ZEND_ORPHANED_OP1;
+			}
+		}
+		if (opline->op2_type & (IS_TMP_VAR|IS_VAR)) {
+			var = EX_VAR_TO_NUM(opline->op2.var) - var_offset;
+			if (opline->opcode == ZEND_FE_FETCH_R || opline->opcode == ZEND_FE_FETCH_RW) {
+				/* OP2 of FE_FETCH is a def, not a use. */
+				last_use[var] = (uint32_t)-1;
+			} else if (last_use[var] == (uint32_t)-1) {
+				last_use[var] = i;
+				last_use_op[var] = ZEND_ORPHANED_OP2;
+			}
+		}
+	}
+
+	free_alloca(last_use, use_heap);
+	return found;
+}
+
 static void zend_optimize(zend_op_array      *op_array,
                           zend_optimizer_ctx *ctx)
 {

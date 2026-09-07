@@ -226,6 +226,36 @@ static void zend_mark_reachable_blocks(const zend_op_array *op_array, zend_cfg *
 			}
 		}
 	}
+
+	/* Ordinary temporaries need the same treatment: an unreachable block may hold the last
+	 * use of a temporary created in a reachable block, and that use is what ends its live
+	 * range. Keep those blocks; the block pass reduces them to the corresponding FREEs. */
+	{
+		zend_basic_block *b;
+		bool has_unreachable = false;
+
+		for (b = blocks; b < blocks + cfg->blocks_count; b++) {
+			if (!(b->flags & (ZEND_BB_REACHABLE|ZEND_BB_UNREACHABLE_FREE)) && b->len) {
+				has_unreachable = true;
+				break;
+			}
+		}
+
+		if (has_unreachable) {
+			ALLOCA_FLAG(use_heap)
+			uint8_t *orphaned = do_alloca(op_array->last, use_heap);
+			uint32_t i;
+
+			if (zend_optimizer_find_orphaned_tmp_uses(op_array, cfg, orphaned)) {
+				for (i = 0; i < op_array->last; i++) {
+					if (orphaned[i]) {
+						blocks[cfg->map[i]].flags |= ZEND_BB_UNREACHABLE_FREE;
+					}
+				}
+			}
+			free_alloca(orphaned, use_heap);
+		}
+	}
 }
 /* }}} */
 

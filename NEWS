@@ -73,6 +73,8 @@ PHP                                                                        NEWS
   . Fixed a tracing JIT crash when compiling a side trace for a method of a
     class that could not be stored in the inheritance cache. (GH-21710)
     (Arnaud, iliaal)
+  . Fixed the block pass leaving a temporary without a live range when its
+    last use was in a removed unreachable block. (Mrmaxmeier)
 
 - PDO:
   . Fixed a leak when a persistent connection failed a liveness check

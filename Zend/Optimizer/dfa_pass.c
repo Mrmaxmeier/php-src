@@ -147,10 +147,16 @@ static void zend_ssa_remove_nops(zend_op_array *op_array, zend_ssa *ssa, zend_op
 				}
 
 				if (b->flags & ZEND_BB_UNREACHABLE_FREE) {
-					/* Only keep the FREE for the loop var */
-					ZEND_ASSERT(op_array->opcodes[b->start].opcode == ZEND_FREE
-							|| op_array->opcodes[b->start].opcode == ZEND_FE_FREE);
-					b->len = 1;
+					/* Only keep the leading FREEs, which is what the block pass reduced
+					 * the block to: they end the live ranges of the variables that were
+					 * created in reachable blocks. */
+					uint32_t n = 0;
+					while (n < b->len
+					 && (op_array->opcodes[b->start + n].opcode == ZEND_FREE
+					  || op_array->opcodes[b->start + n].opcode == ZEND_FE_FREE)) {
+						n++;
+					}
+					b->len = n;
 				}
 
 				new_start = target;
